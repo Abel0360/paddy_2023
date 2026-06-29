@@ -1,0 +1,371 @@
+// =============================================
+// SAMPLE COLLECTION SETUP
+// =============================================
+
+var commandArea = ee.FeatureCollection('projects/dissertation-493911/assets/b_command_area');
+var commandGeometry = commandArea.geometry();
+
+Map.centerObject(commandGeometry, 11);
+
+function maskClouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+var october = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(commandGeometry)
+  .filterDate('2023-10-01', '2023-10-31')
+  .map(maskClouds)
+  .median()
+  .clip(commandGeometry);
+
+// Boundary
+
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: commandArea,
+  color: 1,
+  width: 2
+});
+
+Map.addLayer(outline, {palette: ['FF0000']}, 'Command Area Boundary');
+
+// True Color
+Map.addLayer(october, {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0, max: 3000
+}, 'True Color');
+
+// False Color NIR - USE THIS MAINLY FOR SAMPLE COLLECTION
+Map.addLayer(october, {
+  bands: ['B8', 'B4', 'B3'],
+  min: 0, max: 3000
+}, 'False Color NIR');
+
+// NDVI
+var ndvi = october.normalizedDifference(['B8', 'B4']).rename('NDVI');
+Map.addLayer(ndvi, {
+  min: -0.2, max: 0.8,
+  palette: ['brown', 'yellow', 'lightgreen', 'darkgreen']
+}, 'NDVI');
+
+// LSWI
+var lswi = october.normalizedDifference(['B8', 'B11']).rename('LSWI');
+Map.addLayer(lswi, {
+  min: -0.5, max: 0.5,
+  palette: ['red', 'white', 'blue']
+}, 'LSWI');
+
+// Crop Mask
+var lulc = ee.Image('projects/dissertation-493911/assets/lulc_23')
+  .clip(commandGeometry);
+var cropMask = lulc.eq(5);
+Map.addLayer(cropMask.selfMask(), {
+  palette: ['00FF00']
+}, 'Crop Mask');
+
+print('Ready for sample collection!');
+
+
+// =============================================
+// BHADRA COMMAND AREA - PADDY IDENTIFICATION
+// Multi-temporal Random Forest Classification
+// Kharif 2023 | Xiao et al. 2005 inspired
+// =============================================
+
+// =============================================
+// SECTION 1 - STUDY AREA
+// =============================================
+
+var commandArea = ee.FeatureCollection('projects/dissertation-493911/assets/b_command_area');
+var commandGeometry = commandArea.geometry();
+
+Map.centerObject(commandGeometry, 10);
+
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: commandArea,
+  color: 1,
+  width: 2
+});
+Map.addLayer(outline, {palette: ['FF0000']}, 'Command Area Boundary');
+
+// =============================================
+// SECTION 2 - CLOUD MASKING FUNCTION
+// =============================================
+
+function maskClouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// =============================================
+// SECTION 3 - MONTHLY COMPOSITES
+// Kharif 2023: July to October
+// =============================================
+
+function getMonthly(start, end) {
+  return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(commandGeometry)
+    .filterDate(start, end)
+    .map(maskClouds)
+    .median()
+    .clip(commandGeometry);
+}
+
+var july      = getMonthly('2023-07-01', '2023-07-31');
+var august    = getMonthly('2023-08-01', '2023-08-31');
+var september = getMonthly('2023-09-01', '2023-09-30');
+var october   = getMonthly('2023-10-01', '2023-10-31');
+
+print('Monthly composites loaded!');
+
+// =============================================
+// SECTION 4 - COMPUTE INDICES PER MONTH
+// NDVI and LSWI for each month
+// =============================================
+
+// July
+var ndvi_jul = july.normalizedDifference(['B8','B4']).rename('NDVI_Jul');
+var lswi_jul = july.normalizedDifference(['B8','B11']).rename('LSWI_Jul');
+
+// August
+var ndvi_aug = august.normalizedDifference(['B8','B4']).rename('NDVI_Aug');
+var lswi_aug = august.normalizedDifference(['B8','B11']).rename('LSWI_Aug');
+
+// September
+var ndvi_sep = september.normalizedDifference(['B8','B4']).rename('NDVI_Sep');
+var lswi_sep = september.normalizedDifference(['B8','B11']).rename('LSWI_Sep');
+
+// October
+var ndvi_oct = october.normalizedDifference(['B8','B4']).rename('NDVI_Oct');
+var lswi_oct = october.normalizedDifference(['B8','B11']).rename('LSWI_Oct');
+
+print('Indices computed!');
+
+// =============================================
+// SECTION 5 - BUILD FEATURE STACK
+// 13 features per pixel:
+// 4 NDVI + 4 LSWI + 5 October bands
+// =============================================
+
+var stackedImage = ndvi_jul
+  .addBands(ndvi_aug)
+  .addBands(ndvi_sep)
+  .addBands(ndvi_oct)
+  .addBands(lswi_jul)
+  .addBands(lswi_aug)
+  .addBands(lswi_sep)
+  .addBands(lswi_oct)
+  .addBands(october.select(['B2','B3','B4','B8','B11']))
+  .clip(commandGeometry);
+
+print('Stacked image bands:', stackedImage.bandNames());
+
+// =============================================
+// SECTION 6 - CROP MASK
+// ESRI LULC 2023 Class 5 = Crops
+// =============================================
+
+var lulc = ee.Image('projects/dissertation-493911/assets/lulc_23')
+  .clip(commandGeometry);
+var cropMask = lulc.eq(5);
+
+// Apply crop mask to stacked image
+var maskedStack = stackedImage.updateMask(cropMask);
+
+Map.addLayer(cropMask.selfMask(), {palette: ['00FF00']}, 'Crop Mask');
+
+// =============================================
+// SECTION 7 - PREPARE TRAINING SAMPLES
+// Paddy = 1, NonPaddy = 0
+// =============================================
+
+// Label your polygons
+var paddySamples = Paddy.map(function(f) {
+  return f.set('landcover', 1);
+});
+
+var nonPaddySamples = NonPaddy.map(function(f) {
+  return f.set('landcover', 0);
+});
+
+// Merge all samples
+var allSamples = paddySamples.merge(nonPaddySamples);
+
+print('Total polygons:', allSamples.size());
+
+// =============================================
+// SECTION 8 - EXTRACT SPECTRAL VALUES
+// Sample the stacked image at training polygons
+// =============================================
+
+var bands = ['NDVI_Jul','NDVI_Aug','NDVI_Sep','NDVI_Oct',
+             'LSWI_Jul','LSWI_Aug','LSWI_Sep','LSWI_Oct',
+             'B2','B3','B4','B8','B11'];
+
+var trainingSamples = maskedStack.select(bands).sampleRegions({
+  collection: allSamples,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 4
+});
+
+print('Training samples extracted:', trainingSamples.size());
+
+// =============================================
+// SECTION 9 - SPLIT INTO TRAIN AND TEST
+// 70% training, 30% testing
+// =============================================
+
+var withRandom = trainingSamples.randomColumn('random', 42);
+var trainSet = withRandom.filter(ee.Filter.lt('random', 0.7));
+var testSet  = withRandom.filter(ee.Filter.gte('random', 0.7));
+
+print('Train set size:', trainSet.size());
+print('Test set size:', testSet.size());
+
+// =============================================
+// SECTION 10 - TRAIN RANDOM FOREST
+// 100 decision trees
+// =============================================
+
+var classifier = ee.Classifier.smileRandomForest(100)
+  .train({
+    features: trainSet,
+    classProperty: 'landcover',
+    inputProperties: bands
+  });
+
+print('Random Forest trained!');
+
+// =============================================
+// SECTION 11 - CLASSIFY COMMAND AREA
+// Apply classifier inside crop mask only
+// =============================================
+
+var classified = maskedStack.select(bands)
+  .classify(classifier);
+
+// Display classification result
+Map.addLayer(classified, {
+  min: 0,
+  max: 1,
+  palette: ['orange', 'darkgreen']  // orange = NonPaddy, darkgreen = Paddy
+}, 'Paddy Classification');
+
+// Display October False Color for reference
+Map.addLayer(october, {
+  bands: ['B8','B4','B3'],
+  min: 0, max: 3000
+}, 'October False Color NIR');
+
+print('Classification complete!');
+
+// =============================================
+// SECTION 12 - ACCURACY ASSESSMENT
+// =============================================
+
+var testClassified = testSet.classify(classifier);
+var confusionMatrix = testClassified.errorMatrix('landcover', 'classification');
+
+print('Confusion Matrix:', confusionMatrix);
+print('Overall Accuracy:', confusionMatrix.accuracy());
+print('Kappa Coefficient:', confusionMatrix.kappa());
+print('Producers Accuracy:', confusionMatrix.producersAccuracy());
+print('Users Accuracy:', confusionMatrix.consumersAccuracy());
+
+// =============================================
+// SECTION 13 - CALCULATE PADDY AREA
+// =============================================
+
+// Paddy pixels = class 1
+var paddyOnly = classified.eq(1);
+
+var paddyArea = paddyOnly
+  .multiply(ee.Image.pixelArea())
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: commandGeometry,
+    scale: 10,
+    maxPixels: 1e9,
+    tileScale: 4
+  });
+
+var paddyAreaHa = ee.Number(paddyArea.get('classification'))
+  .divide(10000);
+
+print('Total Paddy Area (hectares):', paddyAreaHa);
+
+
+// =============================================
+// SECTION 14 - EXPORT PADDY MAP
+// =============================================
+
+Export.image.toDrive({
+  image: classified,
+  description: 'Paddy_Classification_Kharif2023',
+  folder: 'Dissertation',
+  fileNamePrefix: 'Paddy_Bhadra_2023',
+  region: commandGeometry,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e9
+});
+
+print('Export task created - check Tasks tab!');
+
+
+// =============================================
+// TOTAL IRRIGATED AREA 2023
+// From ESRI LULC Class 5 (Crops)
+// =============================================
+
+var lulc = ee.Image('projects/dissertation-493911/assets/lulc_23')
+  .clip(commandGeometry);
+
+// Class 5 = Crops = Irrigated cropland
+var cropMask = lulc.eq(5);
+
+// Calculate total cropland area
+var totalCropArea = cropMask
+  .multiply(ee.Image.pixelArea())
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: commandGeometry,
+    scale: 10,
+    maxPixels: 1e9,
+    tileScale: 4
+  });
+
+var totalCropAreaHa = ee.Number(totalCropArea.get('b1'))
+  .divide(10000);
+
+print('Total Irrigated/Cropland Area 2023 (hectares):', totalCropAreaHa);
+
+// Also calculate percentage of command area under crops
+var commandArea_total = ee.Image(1)
+  .clip(commandGeometry)
+  .multiply(ee.Image.pixelArea())
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: commandGeometry,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+var commandAreaHa = ee.Number(commandArea_total.get('constant'))
+  .divide(10000);
+
+print('Total Command Area (hectares):', commandAreaHa);
+
+var percentageCrop = totalCropAreaHa.divide(commandAreaHa).multiply(100);
+print('Percentage under crops (%):', percentageCrop);
